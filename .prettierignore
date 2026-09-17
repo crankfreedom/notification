@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.wrangler/
+bark-worker-master/
+pnpm-lock.yaml

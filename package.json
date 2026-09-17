@@ -1,0 +1,33 @@
+{
+  "name": "notification-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Developer notification hub and project monitoring platform",
+  "packageManager": "pnpm@11.20.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=11.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @notification-hub/web --filter @notification-hub/worker dev",
+    "dev:web": "pnpm --filter @notification-hub/web dev",
+    "dev:worker": "pnpm --filter @notification-hub/worker dev",
+    "build": "pnpm --filter @notification-hub/shared build && pnpm --filter @notification-hub/web build && pnpm --filter @notification-hub/worker build",
+    "typecheck": "pnpm --filter @notification-hub/shared typecheck && pnpm --filter @notification-hub/web typecheck && pnpm --filter @notification-hub/worker typecheck",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:migrate:local": "pnpm --filter @notification-hub/worker db:migrate:local"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "eslint-plugin-vue": "^10.0.0",
+    "globals": "^16.0.0",
+    "prettier": "^3.0.0",
+    "typescript-eslint": "^8.0.0",
+    "vue-eslint-parser": "^10.0.0"
+  }
+}

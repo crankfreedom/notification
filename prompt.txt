@@ -1,0 +1,2201 @@
+# 项目总提示词：Cloudflare PWA 消息推送与项目监控平台
+
+你现在是一名资深全栈架构师、Cloudflare 平台工程师和 Vue / TypeScript 开发工程师。
+
+请帮助我从 0 开始开发一套：
+
+**基于 Cloudflare 的个人消息推送与项目运行监控平台。**
+
+项目定位类似于：
+
+* Bark
+* ntfy
+* Gotify
+* Better Uptime
+* Sentry Notifications
+
+但不要直接复制这些项目。
+
+本项目需要形成自己的特色：
+
+> 面向开发者的轻量级 Notification Hub + Project Monitor。
+
+核心能力是：
+
+其他项目通过调用本平台 HTTP API，将运行状态、成功消息、错误消息、告警、异常、任务结果等发送到本平台。
+
+平台收到消息以后：
+
+1. 保存消息
+2. 实时推送到手机
+3. 在 Dashboard 中展示
+4. 保留历史记录
+5. 后续能够监控项目在线状态
+6. 后续能够扩展多个通知渠道
+
+第一阶段不开发原生 iOS App。
+
+移动端采用：
+
+**PWA + Web Push**
+
+用户可以在 iPhone Safari 中访问平台：
+
+```text
+https://push.example.com
+```
+
+然后：
+
+```text
+分享
+↓
+添加到主屏幕
+↓
+从桌面启动 PWA
+↓
+允许通知
+↓
+接收 iOS Web Push
+```
+
+最终希望形成一个长期可维护、可扩展的项目，而不是简单 Demo。
+
+---
+
+# 一、核心目标
+
+平台整体工作流程：
+
+```text
+项目 A
+项目 B
+AI Agent
+爬虫
+定时任务
+GitHub Actions
+服务器
+Cloudflare Worker
+股票系统
+其他应用
+     │
+     │ HTTP API
+     ▼
+Notification Hub
+     │
+     ├── 验证 API Key
+     │
+     ├── 创建 Message
+     │
+     ├── 保存 D1
+     │
+     └── Web Push
+              │
+              ▼
+         iPhone / Android / PC
+```
+
+例如其他项目调用：
+
+```http
+POST /api/v1/messages
+
+Authorization: Bearer PROJECT_API_KEY
+Content-Type: application/json
+```
+
+Body：
+
+```json
+{
+  "level": "error",
+  "title": "股票数据抓取失败",
+  "message": "TradingView API timeout",
+  "url": "https://example.com/tasks/123",
+  "tags": ["tradingview", "crawler"]
+}
+```
+
+手机应该立即收到：
+
+```text
+股票系统
+
+🔴 股票数据抓取失败
+
+TradingView API timeout
+```
+
+点击通知后进入对应消息详情。
+
+---
+
+# 二、技术栈
+
+整个项目优先采用 TypeScript。
+
+采用 Monorepo。
+
+推荐：
+
+```text
+pnpm workspace
+```
+
+项目结构：
+
+```text
+notification-hub/
+
+├── web/
+│   ├── Vue 3
+│   ├── TypeScript
+│   ├── Vite
+│   ├── Vue Router
+│   ├── Pinia
+│   └── PWA
+│
+├── worker/
+│   ├── Cloudflare Workers
+│   ├── Hono
+│   └── TypeScript
+│
+├── packages/
+│
+│   ├── shared/
+│   │   ├── types
+│   │   ├── enums
+│   │   └── constants
+│   │
+│   └── sdk/
+│       └── JS / TS SDK
+│
+├── migrations/
+│
+├── docs/
+│
+├── package.json
+│
+├── pnpm-workspace.yaml
+│
+└── README.md
+```
+
+---
+
+# 三、Cloudflare 技术架构
+
+第一阶段使用：
+
+```text
+Cloudflare Pages
+Cloudflare Workers
+Cloudflare D1
+Cloudflare KV
+Web Push
+VAPID
+```
+
+后续逐步引入：
+
+```text
+Cloudflare Queues
+Cloudflare Cron Triggers
+Durable Objects
+WebSocket
+```
+
+架构：
+
+```text
+                       Internet
+
+                          │
+                          ▼
+                Cloudflare Worker
+                     Hono API
+                          │
+             ┌────────────┼─────────────┐
+             │            │             │
+             ▼            ▼             ▼
+            D1           KV          Web Push
+             │                          │
+             │                          ▼
+             │                       iPhone
+             │                       Android
+             │                         PC
+             │
+             ▼
+         Dashboard
+```
+
+后续：
+
+```text
+                         Worker
+                           │
+          ┌────────────────┼─────────────────┐
+          │                │                 │
+          ▼                ▼                 ▼
+         D1              Queue              Cron
+                           │                 │
+                           ▼                 ▼
+                       Push Worker       Heartbeat
+                           │             Monitoring
+                           ▼
+                       Web Push
+```
+
+---
+
+# 四、架构原则
+
+项目必须遵守以下原则。
+
+## 1. Web Push 不是数据源
+
+Push 只负责提醒用户。
+
+真正的数据必须保存在 D1。
+
+正确流程：
+
+```text
+收到消息
+↓
+写入 D1
+↓
+发送 Web Push
+↓
+手机收到通知
+↓
+点击通知
+↓
+PWA 调 API 获取完整消息
+```
+
+即使 Push 失败：
+
+消息也不能丢失。
+
+---
+
+## 2. Notification Channel 必须抽象
+
+禁止将 Web Push 逻辑散落在业务代码中。
+
+定义统一接口：
+
+```ts
+interface NotificationChannel {
+  send(
+    message: NotificationMessage,
+    target: NotificationTarget
+  ): Promise<NotificationResult>
+}
+```
+
+第一阶段实现：
+
+```text
+WebPushChannel
+```
+
+未来应该很容易增加：
+
+```text
+APNsChannel
+EmailChannel
+TelegramChannel
+DiscordChannel
+SlackChannel
+WebhookChannel
+SMSChannel
+```
+
+业务层不得依赖具体通知渠道。
+
+---
+
+# 五、核心领域模型
+
+至少包含以下领域对象：
+
+```text
+User
+Project
+ProjectApiKey
+Message
+PushSubscription
+Device
+NotificationDelivery
+Heartbeat
+Incident
+```
+
+第一阶段可以优先实现：
+
+```text
+Project
+ProjectApiKey
+Message
+PushSubscription
+NotificationDelivery
+```
+
+---
+
+# 六、Project
+
+Project 表示一个需要被监控的应用。
+
+例如：
+
+```text
+stock-system
+ai-video
+crawler
+api-server
+github-action
+cloudflare-worker
+agent-manager
+```
+
+建议字段：
+
+```ts
+Project {
+  id
+  name
+  slug
+  description
+
+  status
+
+  icon
+
+  createdAt
+  updatedAt
+}
+```
+
+状态：
+
+```text
+unknown
+online
+offline
+warning
+maintenance
+```
+
+---
+
+# 七、Project API Key
+
+每一个项目拥有独立 API Key。
+
+例如：
+
+```text
+push_xxxxxxxxxxxxxxxxx
+```
+
+调用：
+
+```http
+Authorization: Bearer push_xxxxxxxxx
+```
+
+数据库不能保存 API Key 明文。
+
+只能保存：
+
+```text
+keyPrefix
+keyHash
+```
+
+例如：
+
+```text
+keyPrefix:
+
+push_ab12
+```
+
+用于后台展示：
+
+```text
+push_ab12*************
+```
+
+API Key 需要支持：
+
+```text
+创建
+禁用
+删除
+重新生成
+最后使用时间
+```
+
+---
+
+# 八、Message
+
+核心消息模型：
+
+```ts
+type MessageLevel =
+  | "debug"
+  | "info"
+  | "success"
+  | "warning"
+  | "error"
+  | "critical";
+```
+
+Message：
+
+```ts
+interface Message {
+  id: string;
+
+  projectId: string;
+
+  level: MessageLevel;
+
+  title: string;
+
+  message: string;
+
+  url?: string;
+
+  tags?: string[];
+
+  metadata?: Record<string, unknown>;
+
+  dedupeKey?: string;
+
+  createdAt: string;
+}
+```
+
+metadata 用于携带额外信息：
+
+```json
+{
+  "runtime": "1324ms",
+  "taskId": "task_123",
+  "host": "server-01",
+  "version": "1.3.2"
+}
+```
+
+---
+
+# 九、API 设计
+
+API 使用：
+
+```text
+/api/v1
+```
+
+---
+
+## Health
+
+```http
+GET /api/v1/health
+```
+
+返回：
+
+```json
+{
+  "status": "ok",
+  "timestamp": 0
+}
+```
+
+---
+
+# Project API
+
+```http
+GET /api/v1/projects
+
+POST /api/v1/projects
+
+GET /api/v1/projects/:id
+
+PATCH /api/v1/projects/:id
+
+DELETE /api/v1/projects/:id
+```
+
+---
+
+# API Key
+
+```http
+POST /api/v1/projects/:id/api-keys
+
+GET /api/v1/projects/:id/api-keys
+
+DELETE /api/v1/projects/:id/api-keys/:keyId
+```
+
+---
+
+# Messages
+
+外部项目发送消息：
+
+```http
+POST /api/v1/messages
+```
+
+Header：
+
+```http
+Authorization: Bearer PROJECT_API_KEY
+```
+
+Body：
+
+```json
+{
+  "level": "error",
+  "title": "TradingView API Error",
+  "message": "Request timeout",
+  "url": "https://example.com/task/123",
+  "tags": [
+    "crawler",
+    "stock"
+  ],
+  "metadata": {
+    "taskId": "123"
+  }
+}
+```
+
+返回：
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "msg_xxxxx"
+  }
+}
+```
+
+Dashboard 使用：
+
+```http
+GET /api/v1/messages
+```
+
+支持：
+
+```text
+project
+level
+startTime
+endTime
+keyword
+page
+pageSize
+```
+
+例如：
+
+```text
+/api/v1/messages?project=stock-system&level=error
+```
+
+单条：
+
+```http
+GET /api/v1/messages/:id
+```
+
+---
+
+# 十、Push Subscription
+
+用户第一次安装 PWA：
+
+```text
+PWA
+↓
+Service Worker
+↓
+Notification.requestPermission()
+↓
+PushManager.subscribe()
+```
+
+得到：
+
+```json
+{
+  "endpoint": "...",
+  "keys": {
+    "p256dh": "...",
+    "auth": "..."
+  }
+}
+```
+
+然后：
+
+```http
+POST /api/v1/push/subscriptions
+```
+
+保存到 D1。
+
+建议字段：
+
+```text
+id
+
+endpoint
+
+p256dh
+
+auth
+
+userAgent
+
+platform
+
+deviceName
+
+enabled
+
+createdAt
+
+updatedAt
+
+lastUsedAt
+```
+
+---
+
+# 十一、Web Push
+
+采用标准 Web Push 协议。
+
+使用：
+
+```text
+VAPID Public Key
+VAPID Private Key
+```
+
+Private Key 必须放在：
+
+```text
+Cloudflare Secret
+```
+
+禁止进入：
+
+```text
+Git
+.env.example
+前端
+日志
+```
+
+前端只能获得：
+
+```text
+VAPID_PUBLIC_KEY
+```
+
+---
+
+# 十二、Service Worker
+
+Service Worker 负责：
+
+```text
+PWA Cache
+Push Event
+Notification Click
+```
+
+收到：
+
+```js
+self.addEventListener("push", ...)
+```
+
+显示：
+
+```js
+self.registration.showNotification(...)
+```
+
+Payload 示例：
+
+```json
+{
+  "title": "股票系统",
+  "body": "TradingView API timeout",
+
+  "icon": "/icons/icon-192.png",
+
+  "badge": "/icons/badge.png",
+
+  "data": {
+    "messageId": "msg_xxx",
+    "url": "/messages/msg_xxx"
+  }
+}
+```
+
+点击：
+
+```text
+notificationclick
+```
+
+应该：
+
+```text
+如果 PWA 已打开
+↓
+focus()
+
+否则
+↓
+clients.openWindow()
+```
+
+进入：
+
+```text
+/messages/:id
+```
+
+---
+
+# 十三、iOS PWA
+
+必须特别兼容 iPhone。
+
+需要：
+
+```text
+manifest.webmanifest
+
+display:
+standalone
+
+start_url:
+/
+
+scope:
+/
+
+icons:
+192
+512
+maskable
+```
+
+在 iPhone 上：
+
+```text
+Safari
+↓
+添加到主屏幕
+↓
+从主屏幕打开
+↓
+请求通知权限
+```
+
+不要在页面打开时直接请求通知权限。
+
+必须由用户主动点击：
+
+```text
+开启通知
+```
+
+之后再执行：
+
+```text
+Notification.requestPermission()
+```
+
+---
+
+# 十四、PWA 安装引导
+
+如果检测到：
+
+```text
+iOS
++
+非 standalone
+```
+
+Dashboard 应显示：
+
+```text
+安装到 iPhone
+
+为了正常接收实时通知：
+
+1. 点击 Safari 分享按钮
+2. 点击“添加到主屏幕”
+3. 从桌面打开 Notification Hub
+4. 点击“开启通知”
+```
+
+安装以后不再显示。
+
+---
+
+# 十五、Dashboard
+
+UI 风格：
+
+```text
+简洁
+现代
+开发者工具风格
+Dark Mode 优先
+响应式
+Mobile First
+```
+
+首页：
+
+```text
+Dashboard
+
+Today Messages
+
+Critical
+Error
+Warning
+Success
+
+Active Projects
+
+Recent Messages
+```
+
+示例：
+
+```text
+┌─────────────────────────────────┐
+│ Notification Hub                │
+│                                 │
+│ Today                           │
+│                                 │
+│  Critical  Error  Warning Info │
+│      1       4       8     32  │
+│                                 │
+│ Projects                        │
+│                                 │
+│ ● stock-system                  │
+│ ● api-server                    │
+│ ○ crawler                       │
+│                                 │
+│ Recent                          │
+│                                 │
+│ 🔴 TradingView timeout          │
+│ 🟢 Daily stock task completed   │
+│ 🟡 crawler slow                 │
+│                                 │
+└─────────────────────────────────┘
+```
+
+---
+
+# 十六、页面
+
+至少包含：
+
+```text
+/
+
+Dashboard
+
+/projects
+
+/projects/:id
+
+/messages
+
+/messages/:id
+
+/settings
+
+/settings/notifications
+```
+
+后续：
+
+```text
+/incidents
+
+/devices
+
+/api-keys
+```
+
+---
+
+# 十七、Messages 页面
+
+支持：
+
+```text
+全部
+
+Critical
+
+Error
+
+Warning
+
+Success
+
+Info
+```
+
+支持：
+
+```text
+Project Filter
+
+Level Filter
+
+Time Filter
+
+Search
+```
+
+消息卡片：
+
+```text
+🔴 ERROR
+
+Stock System
+
+TradingView API Timeout
+
+2 minutes ago
+```
+
+---
+
+# 十八、Project Detail
+
+项目详情：
+
+```text
+Project
+
+Status
+
+Last Message
+
+Message Count
+
+Errors Today
+
+Warnings Today
+
+Recent Messages
+```
+
+后续增加：
+
+```text
+Last Heartbeat
+
+Uptime
+
+Incidents
+
+Runtime Metrics
+```
+
+---
+
+# 十九、D1 数据库
+
+请设计规范化数据库。
+
+至少需要：
+
+```text
+projects
+
+project_api_keys
+
+messages
+
+push_subscriptions
+
+notification_deliveries
+```
+
+所有表需要：
+
+```text
+created_at
+updated_at
+```
+
+关键字段建立索引。
+
+例如：
+
+```text
+messages.project_id
+
+messages.level
+
+messages.created_at
+```
+
+---
+
+# 二十、Notification Delivery
+
+每一次 Push 发送都应该记录 Delivery。
+
+例如：
+
+```text
+notification_deliveries
+
+id
+
+message_id
+
+channel
+
+subscription_id
+
+status
+
+attempts
+
+error
+
+created_at
+
+updated_at
+```
+
+status：
+
+```text
+pending
+sent
+failed
+expired
+```
+
+这样未来可以统计：
+
+```text
+Push Success Rate
+Push Failure
+Invalid Subscription
+```
+
+---
+
+# 二十一、无效订阅
+
+Web Push 如果返回：
+
+```text
+404
+410
+```
+
+说明 subscription 已经失效。
+
+必须：
+
+```text
+enabled = false
+```
+
+或者删除 subscription。
+
+避免反复发送。
+
+---
+
+# 二十二、安全
+
+整个项目必须从一开始考虑安全。
+
+至少：
+
+## API Key
+
+只保存 Hash。
+
+---
+
+## Rate Limit
+
+防止某一个 Project：
+
+```text
+无限请求
+```
+
+后续可使用：
+
+```text
+Durable Object
+```
+
+做 rate limit。
+
+第一阶段可以简单实现。
+
+---
+
+## 请求大小限制
+
+例如：
+
+```text
+message <= 10KB
+```
+
+防止恶意 Payload。
+
+---
+
+## 输入验证
+
+所有 API 使用：
+
+```text
+Zod
+```
+
+验证。
+
+---
+
+## CORS
+
+只允许：
+
+```text
+Dashboard Domain
+```
+
+外部消息 API 不依赖浏览器 CORS。
+
+---
+
+# 二十三、消息去重
+
+支持：
+
+```text
+dedupeKey
+```
+
+例如：
+
+```json
+{
+  "dedupeKey": "stock-task-2026-09-17"
+}
+```
+
+短时间内重复：
+
+```text
+dedupeKey
+```
+
+可以选择：
+
+```text
+合并
+忽略
+```
+
+第一版可以先记录字段。
+
+后续实现。
+
+---
+
+# 二十四、第二阶段：Heartbeat
+
+未来项目可以：
+
+```http
+POST /api/v1/heartbeat
+```
+
+Body：
+
+```json
+{
+  "status": "online",
+
+  "version": "1.2.0",
+
+  "metadata": {
+    "memory": 32,
+    "cpu": 15
+  }
+}
+```
+
+数据库：
+
+```text
+project_heartbeats
+```
+
+字段：
+
+```text
+id
+
+project_id
+
+status
+
+metadata
+
+created_at
+```
+
+---
+
+# 二十五、自动离线检测
+
+项目配置：
+
+```text
+heartbeatInterval = 60
+```
+
+例如：
+
+```text
+每 60 秒 heartbeat
+```
+
+Cloudflare Cron：
+
+```text
+每 1 分钟扫描
+```
+
+如果：
+
+```text
+currentTime - lastHeartbeat > threshold
+```
+
+创建：
+
+```text
+Incident
+```
+
+并发送：
+
+```text
+critical
+```
+
+Push。
+
+例如：
+
+```text
+Stock System Offline
+
+Last heartbeat:
+5 minutes ago
+```
+
+---
+
+# 二十六、Incident
+
+后续设计：
+
+```text
+incidents
+
+id
+
+project_id
+
+type
+
+status
+
+title
+
+message
+
+started_at
+
+resolved_at
+```
+
+status：
+
+```text
+open
+resolved
+```
+
+例如：
+
+```text
+API Server Offline
+
+Crawler Timeout
+
+Database Error
+```
+
+---
+
+# 二十七、Cloudflare Queue
+
+第二阶段必须加入 Queue。
+
+不要长期采用：
+
+```text
+HTTP Request
+↓
+同步 Push
+```
+
+应该升级：
+
+```text
+HTTP Request
+↓
+保存 D1
+↓
+Queue
+↓
+立即返回
+```
+
+Consumer：
+
+```text
+Queue
+↓
+Web Push
+↓
+Delivery Record
+```
+
+失败：
+
+```text
+Retry
+```
+
+多次失败：
+
+```text
+DLQ
+```
+
+---
+
+# 二十八、SDK
+
+后续提供：
+
+```text
+@notification-hub/sdk
+```
+
+让其他项目简单调用。
+
+示例：
+
+```ts
+const hub = new NotificationHub({
+  endpoint: "https://push.example.com",
+  apiKey: process.env.PUSH_API_KEY!
+});
+```
+
+使用：
+
+```ts
+await hub.error({
+  title: "Crawler Failed",
+  message: "Request timeout"
+});
+```
+
+或者：
+
+```ts
+await hub.success({
+  title: "Build Complete",
+  message: "Version 1.3 deployed"
+});
+```
+
+---
+
+# 二十九、便捷 API
+
+SDK 最终支持：
+
+```ts
+hub.debug()
+
+hub.info()
+
+hub.success()
+
+hub.warning()
+
+hub.error()
+
+hub.critical()
+```
+
+例如：
+
+```ts
+await hub.success(
+  "Daily Stock Task Finished",
+  "Found 4 candidates"
+);
+```
+
+---
+
+# 三十、兼容 curl
+
+任何语言都可以调用。
+
+例如：
+
+```bash
+curl \
+-X POST \
+https://push.example.com/api/v1/messages \
+-H "Authorization: Bearer PUSH_KEY" \
+-H "Content-Type: application/json" \
+-d '{
+  "level": "success",
+  "title": "Deploy Finished",
+  "message": "Production deployment completed"
+}'
+```
+
+---
+
+# 三十一、代码质量
+
+要求：
+
+```text
+TypeScript strict
+
+ESLint
+
+Prettier
+
+Zod
+
+统一 Error Handler
+
+统一 API Response
+
+统一 Logger
+```
+
+避免：
+
+```text
+any
+```
+
+除非必要。
+
+---
+
+# 三十二、API Response
+
+统一格式。
+
+成功：
+
+```json
+{
+  "success": true,
+  "data": {}
+}
+```
+
+失败：
+
+```json
+{
+  "success": false,
+
+  "error": {
+    "code": "INVALID_API_KEY",
+    "message": "Invalid API key"
+  }
+}
+```
+
+---
+
+# 三十三、错误代码
+
+建立统一：
+
+```text
+INVALID_API_KEY
+
+PROJECT_NOT_FOUND
+
+MESSAGE_NOT_FOUND
+
+INVALID_REQUEST
+
+RATE_LIMITED
+
+PUSH_FAILED
+
+SUBSCRIPTION_NOT_FOUND
+
+INTERNAL_ERROR
+```
+
+---
+
+# 三十四、ID
+
+不要使用数据库自增 ID 暴露给 API。
+
+建议：
+
+```text
+UUID
+```
+
+或者：
+
+```text
+project_xxx
+
+msg_xxx
+
+sub_xxx
+
+key_xxx
+
+delivery_xxx
+```
+
+---
+
+# 三十五、日志
+
+必须提供结构化日志。
+
+例如：
+
+```json
+{
+  "level": "error",
+  "event": "web_push_failed",
+  "messageId": "...",
+  "subscriptionId": "...",
+  "error": "..."
+}
+```
+
+禁止输出：
+
+```text
+API KEY
+VAPID PRIVATE KEY
+完整 Secret
+```
+
+---
+
+# 三十六、README
+
+必须生成完整 README。
+
+README 包含：
+
+```text
+项目介绍
+
+架构
+
+技术栈
+
+本地开发
+
+Cloudflare 配置
+
+D1 初始化
+
+Migration
+
+VAPID Key 创建
+
+环境变量
+
+部署
+
+PWA 安装
+
+iPhone Web Push 使用方式
+
+API 调用示例
+
+curl 示例
+
+SDK 示例
+```
+
+---
+
+# 三十七、环境变量
+
+例如：
+
+```text
+VAPID_PUBLIC_KEY
+
+VAPID_PRIVATE_KEY
+
+VAPID_SUBJECT
+```
+
+Cloudflare：
+
+```text
+wrangler secret
+```
+
+Private Key 不允许提交 Git。
+
+---
+
+# 三十八、开发阶段
+
+不要一次性把所有功能开发完成。
+
+严格按照阶段开发。
+
+---
+
+# Phase 0
+
+完成：
+
+```text
+项目架构设计
+
+Monorepo
+
+pnpm workspace
+
+Vue
+
+Worker
+
+Hono
+
+D1
+
+Wrangler
+```
+
+验收：
+
+```text
+pnpm install
+
+pnpm dev
+
+Worker 正常启动
+
+Web 正常启动
+```
+
+---
+
+# Phase 1
+
+完成：
+
+```text
+D1 Schema
+
+Project CRUD
+
+Project API Key
+
+Message API
+
+Message History
+```
+
+验收：
+
+```text
+curl
+↓
+POST message
+↓
+D1 出现记录
+↓
+Dashboard 可以看到
+```
+
+---
+
+# Phase 2
+
+完成：
+
+```text
+PWA
+
+Manifest
+
+Service Worker
+
+Push Subscription
+
+VAPID
+
+Web Push
+```
+
+验收：
+
+```text
+iPhone
+↓
+添加到主屏幕
+↓
+开启通知
+↓
+调用 API
+↓
+iPhone 收到系统通知
+```
+
+这是 V1 最重要的验收标准。
+
+---
+
+# Phase 3
+
+完成：
+
+```text
+Dashboard
+
+Projects
+
+Messages
+
+Message Detail
+
+Settings
+
+Dark Mode
+
+Responsive
+```
+
+---
+
+# Phase 4
+
+完成：
+
+```text
+Cloudflare Queue
+
+Push Retry
+
+Delivery Logs
+
+Invalid Subscription Cleanup
+```
+
+---
+
+# Phase 5
+
+完成：
+
+```text
+Heartbeat
+
+Cron
+
+Offline Detection
+
+Incident
+```
+
+---
+
+# Phase 6
+
+完成：
+
+```text
+JS SDK
+
+Documentation
+
+Docker / Local Dev Support
+
+Testing
+```
+
+---
+
+# 三十九、测试
+
+需要：
+
+```text
+Unit Test
+
+API Test
+
+Push Service Test
+```
+
+至少测试：
+
+```text
+invalid API key
+
+missing fields
+
+invalid level
+
+successful message
+
+expired subscription
+
+Web Push failure
+
+duplicate request
+```
+
+---
+
+# 四十、V1 范围控制
+
+第一版不要加入：
+
+```text
+原生 iOS App
+
+Android App
+
+复杂权限系统
+
+多人团队
+
+组织
+
+计费
+
+支付
+
+SMS
+
+Email
+
+Telegram
+
+复杂 Metrics
+
+复杂 APM
+```
+
+这些都不是 V1 必需功能。
+
+---
+
+# 四十一、V1 的唯一核心目标
+
+V1 必须完成这条完整链路：
+
+```text
+一个外部项目
+
+        ↓
+
+POST /api/v1/messages
+
+        ↓
+
+Cloudflare Worker
+
+        ↓
+
+验证 Project API Key
+
+        ↓
+
+保存 D1
+
+        ↓
+
+Web Push
+
+        ↓
+
+iPhone PWA
+
+        ↓
+
+系统通知
+
+        ↓
+
+点击
+
+        ↓
+
+Message Detail
+```
+
+只有这条链路完整跑通，才算 V1 成功。
+
+---
+
+# 四十二、重要架构要求
+
+设计任何模块之前都需要考虑：
+
+```text
+以后增加 APNs 是否容易？
+
+以后增加 Android 是否容易？
+
+以后增加 Telegram 是否容易？
+
+以后增加 Email 是否容易？
+
+以后增加多个用户是否容易？
+
+以后增加 Project Heartbeat 是否容易？
+
+以后增加 Queue 是否容易？
+```
+
+但：
+
+不要为了未来可能发生的功能进行过度设计。
+
+遵循：
+
+```text
+Simple First
+
+Modular
+
+Extensible
+
+Cloudflare Native
+```
+
+---
+
+# 四十三、最终项目定位
+
+请始终牢记：
+
+这不是：
+
+```text
+简单 Push Demo
+```
+
+也不是：
+
+```text
+Bark Clone
+```
+
+而是：
+
+# Developer Notification Hub
+
+目标：
+
+```text
+Message Push
+
+Project Monitoring
+
+Heartbeat
+
+Incident
+
+Notification Center
+
+Developer SDK
+```
+
+最终类似：
+
+```text
+Bark
++
+ntfy
++
+Better Uptime
++
+Sentry Notifications
+```
+
+的轻量化个人版本。
+
+---
+
+# 四十四、你的工作方式
+
+接下来不要一次性生成整个项目。
+
+你需要作为项目主 Agent 来推进整个工程。
+
+每个阶段执行：
+
+```text
+分析
+↓
+设计
+↓
+实现
+↓
+运行
+↓
+检查
+↓
+修复
+↓
+验证
+↓
+提交阶段总结
+```
+
+完成一个阶段后再进入下一个阶段。
+
+每完成一个 Phase：
+
+输出：
+
+```text
+本阶段完成内容
+
+新增文件
+
+修改文件
+
+数据库变化
+
+API 变化
+
+如何运行
+
+如何测试
+
+当前已知问题
+
+下一阶段计划
+```
+
+---
+
+# 四十五、第一步
+
+现在请先执行：
+
+# Phase 0
+
+不要直接实现所有业务。
+
+先完成：
+
+```text
+1. 设计最终 Monorepo 目录结构
+
+2. 初始化 pnpm workspace
+
+3. 创建 Vue3 + TypeScript + Vite Web
+
+4. 创建 Cloudflare Worker + Hono
+
+5. 配置 Wrangler
+
+6. 配置 D1
+
+7. 建立 shared package
+
+8. 配置 TypeScript
+
+9. 配置 ESLint
+
+10. 配置开发命令
+
+11. 编写基础 README
+
+12. 确保 Web 和 Worker 都能够正常启动
+```
+
+然后输出 Phase 0 完成报告。
+
+确认 Phase 0 可以正常运行之后，再继续 Phase 1。
+
+不要跳过运行验证步骤。
