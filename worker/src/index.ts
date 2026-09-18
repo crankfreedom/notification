@@ -1,14 +1,21 @@
 import {
   API_PREFIX,
   createMessageSchema,
+  createPushSubscriptionSchema,
   createProjectSchema,
   failure,
   success,
   updateProjectSchema,
 } from '@notification-hub/shared';
 import { Hono } from 'hono';
+import { WebPushChannel, type NotificationMessage } from './notifications';
 
-type Bindings = { NOTIFICATION_DB: D1Database };
+type Bindings = {
+  NOTIFICATION_DB: D1Database;
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
+};
 type ProjectRow = {
   id: string;
   name: string;
@@ -32,6 +39,7 @@ type MessageRow = {
   dedupe_key: string | null;
   created_at: string;
 };
+type PushSubscriptionRow = { id: string; endpoint: string; p256dh: string; auth: string };
 
 const app = new Hono<{ Bindings: Bindings }>();
 const encoder = new TextEncoder();
@@ -64,6 +72,59 @@ const messageDto = (row: MessageRow) => ({
   createdAt: row.created_at,
 });
 const invalid = (message: string) => failure('INVALID_REQUEST', message);
+const subscriptionDto = (row: {
+  id: string;
+  endpoint: string;
+  enabled: number;
+  expiration_time: number | null;
+  created_at: string;
+  updated_at: string;
+}) => ({
+  id: row.id,
+  endpoint: row.endpoint,
+  enabled: Boolean(row.enabled),
+  expirationTime: row.expiration_time ?? undefined,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+const deliverMessage = async (
+  database: D1Database,
+  env: Bindings,
+  message: NotificationMessage,
+) => {
+  const { results } = await database
+    .prepare('SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE enabled = 1')
+    .all<PushSubscriptionRow>();
+  const channel = new WebPushChannel(env);
+  await Promise.all(
+    (results ?? []).map(async (subscription) => {
+      const result = await channel.send(message, subscription);
+      await database.batch([
+        database
+          .prepare(
+            'INSERT INTO notification_deliveries (id, message_id, channel, subscription_id, status, error) VALUES (?, ?, ?, ?, ?, ?)',
+          )
+          .bind(
+            publicId('delivery'),
+            message.id,
+            'web_push',
+            subscription.id,
+            result.status,
+            result.error ?? null,
+          ),
+        ...(result.status === 'expired'
+          ? [
+              database
+                .prepare(
+                  'UPDATE push_subscriptions SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                )
+                .bind(subscription.id),
+            ]
+          : []),
+      ]);
+    }),
+  );
+};
 
 app.get(`${API_PREFIX}/health`, (context) => context.json({ status: 'ok', timestamp: Date.now() }));
 app.get(`${API_PREFIX}/projects`, async (context) => {
@@ -185,6 +246,68 @@ app.delete(`${API_PREFIX}/projects/:id/api-keys/:keyId`, async (context) => {
     ? context.body(null, 204)
     : context.json(failure('INVALID_REQUEST', 'API key not found.'), 404);
 });
+app.get(`${API_PREFIX}/push/vapid-public-key`, (context) => {
+  const publicKey = context.env.VAPID_PUBLIC_KEY;
+  return publicKey
+    ? context.json(success({ publicKey }))
+    : context.json(failure('PUSH_FAILED', 'Web Push is not configured.'), 503);
+});
+app.get(`${API_PREFIX}/push/subscriptions`, async (context) => {
+  const { results } = await context.env.NOTIFICATION_DB.prepare(
+    'SELECT id, endpoint, enabled, expiration_time, created_at, updated_at FROM push_subscriptions ORDER BY created_at DESC',
+  ).all<{
+    id: string;
+    endpoint: string;
+    enabled: number;
+    expiration_time: number | null;
+    created_at: string;
+    updated_at: string;
+  }>();
+  return context.json(success((results ?? []).map(subscriptionDto)));
+});
+app.post(`${API_PREFIX}/push/subscriptions`, async (context) => {
+  const input = createPushSubscriptionSchema.safeParse(await context.req.json().catch(() => null));
+  if (!input.success)
+    return context.json(invalid(input.error.issues[0]?.message ?? '请求体无效'), 400);
+  const id = publicId('sub');
+  await context.env.NOTIFICATION_DB.prepare(
+    `INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, expiration_time)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
+       expiration_time = excluded.expiration_time, enabled = 1, updated_at = CURRENT_TIMESTAMP`,
+  )
+    .bind(
+      id,
+      input.data.endpoint,
+      input.data.keys.p256dh,
+      input.data.keys.auth,
+      input.data.expirationTime ?? null,
+    )
+    .run();
+  const row = await context.env.NOTIFICATION_DB.prepare(
+    'SELECT id, endpoint, enabled, expiration_time, created_at, updated_at FROM push_subscriptions WHERE endpoint = ?',
+  )
+    .bind(input.data.endpoint)
+    .first<{
+      id: string;
+      endpoint: string;
+      enabled: number;
+      expiration_time: number | null;
+      created_at: string;
+      updated_at: string;
+    }>();
+  return context.json(success(subscriptionDto(row!)), 201);
+});
+app.delete(`${API_PREFIX}/push/subscriptions/:id`, async (context) => {
+  const result = await context.env.NOTIFICATION_DB.prepare(
+    'DELETE FROM push_subscriptions WHERE id = ?',
+  )
+    .bind(context.req.param('id'))
+    .run();
+  return result.meta.changes
+    ? context.body(null, 204)
+    : context.json(failure('SUBSCRIPTION_NOT_FOUND', 'Push subscription not found.'), 404);
+});
 app.post(`${API_PREFIX}/messages`, async (context) => {
   const authorization = context.req.header('Authorization');
   if (!authorization?.startsWith('Bearer '))
@@ -217,6 +340,14 @@ app.post(`${API_PREFIX}/messages`, async (context) => {
       'UPDATE project_api_keys SET last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
     ).bind(apiKey.id),
   ]);
+  context.executionCtx.waitUntil(
+    deliverMessage(context.env.NOTIFICATION_DB, context.env, {
+      id,
+      title: input.data.title,
+      message: input.data.message,
+      url: input.data.url,
+    }),
+  );
   return context.json(success({ id }), 201);
 });
 app.get(`${API_PREFIX}/messages`, async (context) => {

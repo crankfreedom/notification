@@ -61,5 +61,14 @@ export const createMessageSchema = z.object({
   metadata: z.record(z.unknown()).optional(),
   dedupeKey: z.string().trim().min(1).max(200).optional(),
 });
+export const createPushSubscriptionSchema = z.object({
+  endpoint: z.string().url().max(2_000),
+  expirationTime: z.number().int().positive().nullable().optional(),
+  keys: z.object({
+    p256dh: z.string().trim().min(1).max(512),
+    auth: z.string().trim().min(1).max(512),
+  }),
+});
 export type CreateProjectInput = z.infer<typeof createProjectSchema>;
 export type CreateMessageInput = z.infer<typeof createMessageSchema>;
+export type CreatePushSubscriptionInput = z.infer<typeof createPushSubscriptionSchema>;
